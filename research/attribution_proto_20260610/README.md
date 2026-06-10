@@ -1,4 +1,33 @@
-# 说话人识别 L1 规则层原型验证（2026-06-10）
+# 说话人识别 L1 规则层 + L2 CSI 模型验证（2026-06-10）
+
+> 结论先行：**L1+L2 融合在难样本上 86%（L1 单独 71%，L2 单独 71%），错误几乎不重叠，融合有效；
+> RoBERTa-CSI 方案可用，正式实现在 `src/book2audio/attribution.py`。**
+
+## L2: CSI 模型（chinese-roberta-wwm-ext-large-csi-v1）
+
+- 模型：[Warma10032/chinese-roberta-wwm-ext-large-csi-v1](https://huggingface.co/Warma10032/chinese-roberta-wwm-ext-large-csi-v1)，1.3GB，BERT-large + 抽取式MRC头，下载至 `models/csi-v1/`
+- 输入构造（沿用 easytts 方案）：question=引文+相邻旁白句，context=前3句+引文+后3句，从 context 抽说话人 span
+- 权重可直接载入 transformers `BertForQuestionAnswering`（多出的 pooler 忽略），与原版自定义 BERT 数值一致（logits diff < 0.005）
+- ⚠️ 踩坑：transformers 5.x 的 `BertTokenizer(vocab_file=...)` 裸构建会把中文全部变成 `[UNK]`（导致首次评测仅 7%），必须用 `tokenizers.BertWordPieceTokenizer`
+- `eval_easytts_pipeline.py` 用 easytts 原版管线交叉验证（需 clone easytts 到 /tmp/easytts_ref），与自实现结果一致
+
+## 评测结果（chat.txt，14条对白金标 gold_chat.json）
+
+| 方案 | 准确率 | 备注 |
+|---|---|---|
+| L1 规则单独 | 10/14 = 71% | 错误：远距离归属/称谓/代词/新角色 |
+| L2 CSI 单独 | 10/14 = 71% | 错误：指代性名词(女孩)/无名角色 |
+| **L1+L2 融合** | **12/14 = 86%** | 阈值过滤(8.5/9.5)+称呼语排除+拟声词过滤后 |
+
+融合策略：R1/R2（同段名字+动词）> CSI（span 映射到角色名 + 置信阈值 + 受话人排除）> R3 邻段主语 > R4 双人轮替。
+剩余 2 错均为世界知识 case：说话人名字数段后才出现、"田芸的父亲"≡田叔 别名消解。
+
+《玄鉴仙族》第一章盲测（17条）：15 正确、2 条安全未识别（落旁白音色）、1 条真错（梦中无名女声）；
+拟声词（“咣当！”“哗啦！”）已正确分类为 sfx 不参与归属。
+
+---
+
+## 附：L1 规则层单独验证（早期记录）
 
 测试样本：`book/chat.txt`（《玄鉴仙族》第三章节选，14 条对白，含多角色对话），金标为人工标注。
 
@@ -33,6 +62,7 @@ uv run python research/attribution_proto_20260610/proto_rules.py book/chat.txt
 
 ## 下一步
 
-1. 接入 `chinese-roberta-wwm-ext-csi` 跑同一样本，对比 L1+L2 准确率
-2. 用 NER 重建人名清单
-3. 扩大金标集到 100-200 条（《玄鉴仙族》前 3 章）
+1. ✅ 接入 CSI 模型（本文档上半部分，正式代码 `src/book2audio/attribution.py`）
+2. 把识别结果接入 TTS 流水线：角色→音色自动分配
+3. 扩大金标集到 100-200 条；别名消解（"X的父亲"）与无名角色（"女声"）处理
+4. 性能：CSI 在 CPU 上单条约 1-2s，整章可接受；整本书建议批量+缓存

@@ -46,6 +46,7 @@
 | 2026-06-10 | 说话人识别改为 规则引擎 + CSI 专用模型（chinese-roberta-wwm-ext-csi） | 程序化方案确定性高、快；0.6B LLM 逐句归属不可控。详见 research/tech_reselect_20260610/ | ✅ 决定 |
 | 2026-06-10 | TTS 主线换 CosyVoice3-0.5B；预留 IndexTTS-2（远程GPU）/豆包API 高质量后端 | 真人感代际提升；Mac 无 CUDA 跑不了 IndexTTS-2 | ✅ 决定 |
 | 2026-06-10 | 背景音/环境音 列为 P2 | 先跑通多角色语音主线 | ✅ 决定 |
+| 2026-06-10 | L2 采用 CSI RoBERTa（csi-v1, 1.3GB）+ L1 规则融合 | chat.txt 金标：L1 71% / L2 71% / 融合 86%，错误互补；剩余错误为世界知识 case，暂不需要换模型。详见 research/attribution_proto_20260610/ | ✅ 决定 |
 
 ---
 

@@ -1,0 +1,20 @@
+{
+  "source": "book/chat.txt",
+  "note": "人工标注金标。speaker 为规范化角色名；田芸的父亲即田叔。",
+  "quotes": [
+    {"quote": "害，项平哥。", "speaker": "田芸"},
+    {"quote": "芸妹", "speaker": "李项平"},
+    {"quote": "看哥抓的好鱼，你要上几条回去尝尝。", "speaker": "李项平"},
+    {"quote": "这可使不得。", "speaker": "田芸"},
+    {"quote": "不行，拿去！", "speaker": "李项平"},
+    {"quote": "李木田真是好福气！", "speaker": "田叔"},
+    {"quote": "好男丁就该读书将兵，在田里是孬种！", "speaker": "李木田"},
+    {"quote": "三弟慢着走，不急。", "speaker": "李长湖"},
+    {"quote": "听田叔说你今天收获很多哟", "speaker": "李长湖"},
+    {"quote": "太多了哥！", "speaker": "李项平"},
+    {"quote": "今晚可算吃顿好的了！", "speaker": "李项平"},
+    {"quote": "你呀。", "speaker": "李长湖"},
+    {"quote": "二弟——", "speaker": "李长湖"},
+    {"quote": "来喽！", "speaker": "李通崖"}
+  ]
+}

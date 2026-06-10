@@ -2,8 +2,13 @@
 name = "book2audio"
 version = "0.1.0"
 description = "智能有声书工具 - 将小说TXT转化为多角色有声书"
-requires-python = ">=3.9"
-dependencies = ["edge-tts>=6.1"]
+requires-python = ">=3.11"
+dependencies = [
+    "edge-tts>=6.1",
+    "huggingface-hub>=1.8.0",
+    "torch>=2.12.0",
+    "transformers>=5.10.2",
+]
 
 [project.optional-dependencies]
 kokoro = ["kokoro-onnx"]
