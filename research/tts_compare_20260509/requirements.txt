@@ -1,0 +1,13 @@
+# TTS 依赖包
+numpy
+scipy
+soundfile
+psutil
+torch
+torchaudio
+kokoro-onnx
+transformers
+
+# 其他可能的依赖
+tqdm
+requests

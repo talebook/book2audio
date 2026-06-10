@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# book2audio: 大文件与本地产物
+book/
+output/
+models/
+pretrained_models/
+temp_cosyvoice/
+venv/
