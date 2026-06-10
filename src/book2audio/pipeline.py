@@ -12,7 +12,7 @@ import edge_tts
 
 from .parser import Chapter, split_chapters, split_segments
 
-# 音色配置：旁白用沉稳男声，对白用年轻男声做区分（后续接入说话人识别后按角色分配）
+# 双音色基线：旁白沉稳男声 + 对白统一年轻男声（--multi-voice 时按角色画像分配）
 NARRATOR_VOICE = "zh-CN-YunjianNeural"
 DIALOGUE_VOICE = "zh-CN-YunxiNeural"
 
@@ -20,11 +20,12 @@ CONCURRENCY = 4
 MAX_RETRIES = 3
 
 
-async def _synth_one(text: str, voice: str, out_path: Path, sem: asyncio.Semaphore):
+async def _synth_one(text: str, voice: str, out_path: Path, sem: asyncio.Semaphore,
+                     rate: str = "+0%", pitch: str = "+0Hz"):
     async with sem:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                await edge_tts.Communicate(text, voice).save(str(out_path))
+                await edge_tts.Communicate(text, voice, rate=rate, pitch=pitch).save(str(out_path))
                 if out_path.stat().st_size > 0:
                     return
             except Exception as e:
@@ -33,22 +34,58 @@ async def _synth_one(text: str, voice: str, out_path: Path, sem: asyncio.Semapho
                 await asyncio.sleep(2 * attempt)
 
 
-async def synth_chapter(chapter: Chapter, work_dir: Path) -> Path:
-    """合成单章音频，返回章节 mp3 路径。"""
-    segments = split_segments(chapter.content)
-    # 章节标题作为开场旁白
-    parts = [("narration", chapter.title)] + [(s.kind, s.text) for s in segments]
+def _multivoice_parts(chapter: Chapter, quotes, voices):
+    """按说话人归属结果构造 (text, (voice, rate, pitch)) 列表。"""
+    from .profile import NARRATOR
+
+    by_para = {}
+    for q in quotes:
+        by_para.setdefault(q.para_idx, []).append(q)
+
+    parts = [(chapter.title, NARRATOR)]
+    paras = [p.strip() for p in chapter.content.splitlines() if p.strip()]
+    for pi, para in enumerate(paras):
+        pos = 0
+        for q in sorted(by_para.get(pi, []), key=lambda x: x.span[0]):
+            if para[pos:q.span[0]].strip():
+                parts.append((para[pos:q.span[0]], NARRATOR))
+            if q.kind == "sfx" or not q.speaker:
+                # 拟声词/未识别 → 旁白连引号一起读
+                parts.append((para[q.span[0]:q.span[1]], NARRATOR))
+            else:
+                parts.append((q.text, voices.get(q.speaker, (DIALOGUE_VOICE, "+0%", "+0Hz"))))
+            pos = q.span[1]
+        if para[pos:].strip():
+            parts.append((para[pos:], NARRATOR))
+    # 合并相邻同音色片段，减少请求数
+    merged = []
+    for text, v in parts:
+        if merged and merged[-1][1] == v:
+            merged[-1] = (merged[-1][0] + "\n" + text, v)
+        else:
+            merged.append((text, v))
+    return merged
+
+
+async def synth_chapter(chapter: Chapter, work_dir: Path, quotes=None, voices=None) -> Path:
+    """合成单章音频，返回章节 mp3 路径。quotes/voices 提供时启用多角色音色。"""
+    if quotes is not None:
+        parts = _multivoice_parts(chapter, quotes, voices)
+    else:
+        segments = split_segments(chapter.content)
+        parts = [(chapter.title, (NARRATOR_VOICE, "+0%", "+0Hz"))] + [
+            (s.text, ((NARRATOR_VOICE if s.kind == "narration" else DIALOGUE_VOICE), "+0%", "+0Hz"))
+            for s in segments]
 
     sem = asyncio.Semaphore(CONCURRENCY)
     seg_dir = work_dir / f"ch{chapter.num:04d}"
     seg_dir.mkdir(parents=True, exist_ok=True)
     tasks = []
     seg_files = []
-    for i, (kind, text) in enumerate(parts):
-        voice = NARRATOR_VOICE if kind == "narration" else DIALOGUE_VOICE
+    for i, (text, (voice, rate, pitch)) in enumerate(parts):
         f = seg_dir / f"{i:05d}.mp3"
         seg_files.append(f)
-        tasks.append(_synth_one(text, voice, f, sem))
+        tasks.append(_synth_one(text, voice, f, sem, rate, pitch))
     await asyncio.gather(*tasks)
 
     # ffmpeg concat 合并段落
@@ -96,7 +133,8 @@ def assemble_mp4(chapters: List[Chapter], chapter_files: List[Path], output: Pat
     )
 
 
-def run(input_txt: Path, output: Path, chapter_range: range, keep_temp: bool = False):
+def run(input_txt: Path, output: Path, chapter_range: range, keep_temp: bool = False,
+        multi_voice: bool = False, csi_model_dir: Path = Path("models/csi-v1")):
     text = input_txt.read_text(encoding="utf-8")
     all_chapters = split_chapters(text)
     chapters = [c for c in all_chapters if c.num in chapter_range]
@@ -104,12 +142,30 @@ def run(input_txt: Path, output: Path, chapter_range: range, keep_temp: bool = F
         raise SystemExit(f"未找到指定章节（全书共 {len(all_chapters)} 章）")
     print(f"共 {len(all_chapters)} 章，本次合成 {len(chapters)} 章: {chapters[0].title} .. {chapters[-1].title}")
 
+    quotes_by_ch, voices = {}, None
+    if multi_voice:
+        from .attribution import Attributor
+        from .profile import assign_voices, build_profiles
+        attributor = Attributor(csi_model_dir=csi_model_dir if csi_model_dir.exists() else None)
+        selected = "\n".join(c.content for c in chapters)
+        attributor.build_names(selected)
+        # 先完成全部归属（CSI 会动态发现新角色），再建画像和音色表
+        for ch in chapters:
+            print(f"识别 {ch.title} 说话人...")
+            quotes_by_ch[ch.num] = attributor.attribute(ch.content)
+        profiles = build_profiles(selected, attributor.names)
+        voices = assign_voices(profiles)
+        print("角色音色分配:")
+        for n, (v, rate, pitch) in sorted(voices.items()):
+            p = profiles[n]
+            print(f"  {n}: {p.gender}/{p.age_stage}{f'/{p.age}岁' if p.age else ''} → {v.replace('zh-CN-', '')} {rate} {pitch}")
+
     work_dir = Path(tempfile.mkdtemp(prefix="book2audio_"))
     try:
         chapter_files = []
         for ch in chapters:
             print(f"[{ch.num}/{chapters[-1].num}] 合成 {ch.title} ({len(ch.content)} 字)...")
-            chapter_files.append(asyncio.run(synth_chapter(ch, work_dir)))
+            chapter_files.append(asyncio.run(synth_chapter(ch, work_dir, quotes_by_ch.get(ch.num), voices)))
         print("拼接并编码 MP4...")
         assemble_mp4(chapters, chapter_files, output, work_dir)
         print(f"完成: {output}")

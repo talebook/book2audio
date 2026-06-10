@@ -56,13 +56,14 @@ class Attributor:
                     counts[m.group(1)] = counts.get(m.group(1), 0) + 1
         # 必须至少出现一次"名字+说话动词"（仅段首高频不算，避免"剧烈的摇晃"这类误收）
         cand = {n for n, c in counts.items() if c >= 2 and verb_counts.get(n, 0) >= 1}
+        # 去掉被更长名字包含的碎片（"长湖"⊂"李长湖"，前后缀都算）
         self.names |= {n for n in cand
-                       if not any(o != n and o.startswith(n) and counts[o] >= counts[n] for o in cand)}
+                       if not any(o != n and n in o and counts[o] >= counts[n] for o in cand)}
 
     def to_name(self, cand: str) -> Optional[str]:
-        """候选串映射到已知角色名（前缀互含）。"""
+        """候选串映射到已知角色名（互为子串即认为同一角色，如"长湖"→"李长湖"）。"""
         for n in sorted(self.names, key=len, reverse=True):
-            if cand.startswith(n) or n.startswith(cand):
+            if cand in n or n in cand:
                 return n
         return None
 
