@@ -21,6 +21,21 @@ SENT_SPLIT = re.compile(r"(?<=[。！？\n])")
 # CSI span 清洗：剥掉亲属/排行称谓前缀与语气成分
 TITLE_PREFIX = re.compile(r"^(大哥|二哥|三哥|四哥|大姐|二姐|三弟|四弟|老大|老二|老三|老四)")
 PRONOUNS = {"他", "她", "它", "他们", "她们", "女孩", "男孩", "女子", "男子", "老者", "少年", "众人"}
+# "副词+说话动词"高频搭配会被词频法误收为人名（"连忙道"/"默默地想"）
+NAME_STOPWORDS = {
+    "这么", "那么", "什么", "怎么", "连忙", "急忙", "赶忙", "顿时", "默默", "突然", "忽然",
+    "马上", "立刻", "随即", "当即", "只是", "可是", "但是", "于是", "然后", "这样", "那样",
+    "如此", "一边", "一面", "接着", "跟着", "继续", "开口", "闻言", "当下", "心中", "心里",
+    "口中", "大声", "小声", "低声", "高声", "连声", "齐声", "失声", "出声", "轻声", "沉声",
+    "厉声", "柔声", "朗声", "一声", "说完", "听完", "点头", "摇头", "笑着", "哭着", "似乎",
+    "仿佛", "彷佛", "不禁", "不由", "暗暗", "暗自", "喃喃", "自己", "众人", "有人", "no",
+}
+
+
+def plausible_name(cand: str) -> bool:
+    return (cand not in NAME_STOPWORDS
+            and not cand.endswith(("地", "得", "的", "着", "了"))
+            and not any(w in cand for w in ("这", "那", "什", "怎")))
 
 R2_BEFORE = re.compile(rf"({NAME})[^“”]{{0,12}}?(?:{SPEECH_VERBS})[^“”]{{0,4}}[:：]?\s*$")
 SUBJ_LEAD = re.compile(rf"^({NAME})")
@@ -55,7 +70,8 @@ class Attributor:
                 if m:
                     counts[m.group(1)] = counts.get(m.group(1), 0) + 1
         # 必须至少出现一次"名字+说话动词"（仅段首高频不算，避免"剧烈的摇晃"这类误收）
-        cand = {n for n, c in counts.items() if c >= 2 and verb_counts.get(n, 0) >= 1}
+        cand = {n for n, c in counts.items()
+                if c >= 2 and verb_counts.get(n, 0) >= 1 and plausible_name(n)}
         # 去掉被更长名字包含的碎片（"长湖"⊂"李长湖"，前后缀都算）
         self.names |= {n for n in cand
                        if not any(o != n and n in o and counts[o] >= counts[n] for o in cand)}
@@ -82,7 +98,7 @@ class Attributor:
         if known:
             return known
         # 未知但像人名（2-4字纯汉字）且高置信 → 接受为新角色
-        if score >= self.CSI_NEW_NAME and re.fullmatch(r"[一-龥]{2,4}", span):
+        if score >= self.CSI_NEW_NAME and re.fullmatch(r"[一-龥]{2,4}", span) and plausible_name(span):
             self.names.add(span)
             return span
         return None

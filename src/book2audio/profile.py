@@ -74,6 +74,7 @@ def build_profiles(text: str, names: set) -> Dict[str, CharacterProfile]:
         p = profiles[name]
         f_votes = m_votes = 0
         stage_votes: Dict[str, int] = {}
+        age_mentions: List[int] = []
         others = names - {name}
 
         def near(para, m, radius):
@@ -90,13 +91,14 @@ def build_profiles(text: str, names: set) -> Dict[str, CharacterProfile]:
                 m_votes += 3 * len(re.findall(MALE_NOUNS, gw))
                 f_votes += len(re.findall(r"她", gw))
                 m_votes += len(re.findall(r"他", gw))
-                # 年龄："十三岁的李项平" / "她今年十一" 等，取名字附近第一个年龄
-                if p.age is None:
-                    am = AGE_RE.search(window)
-                    if am:
-                        age = cn2int(am.group(1))
-                        if age and 3 <= age <= 99:
-                            p.age = age
+                # 年龄："十三岁的李项平" / "十几岁" / "四十多岁"，收集全部证据
+                for am in AGE_RE.finditer(window):
+                    age = cn2int(am.group(1))
+                    if age:
+                        if am.group(2):  # 多/来/几 → 加半档
+                            age += 5
+                        if 3 <= age <= 99:
+                            age_mentions.append(age)
                             p.evidence.append(window.strip()[:40])
                 # 年龄阶段词
                 for stage, words in STAGE_WORDS.items():
@@ -122,6 +124,8 @@ def build_profiles(text: str, names: set) -> Dict[str, CharacterProfile]:
             m_votes += 10
 
         p.gender = "female" if f_votes > m_votes else "male" if m_votes > f_votes else "unknown"
+        if age_mentions:  # 多处提及取中位数，抗"十几岁左右"这类粗略描述
+            p.age = sorted(age_mentions)[len(age_mentions) // 2]
         if p.age is not None:
             p.age_stage = age_to_stage(p.age)
         elif stage_votes:
