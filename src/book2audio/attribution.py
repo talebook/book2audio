@@ -202,7 +202,10 @@ class Attributor:
             tok = BertWordPieceTokenizer(str(d / "vocab.txt"), lowercase=True)
             tok.enable_truncation(max_length=512, strategy="only_second")
             model = BertForQuestionAnswering(BertConfig.from_json_file(d / "config.json"))
-            state = torch.load(d / "csi-v1.pth", map_location="cpu", weights_only=True)
+            # 优先 fp16 存档（体积减半），加载后转回 fp32 计算（CPU 上 fp16 算子反而慢）
+            ckpt = d / "csi-v1-fp16.pth" if (d / "csi-v1-fp16.pth").exists() else d / "csi-v1.pth"
+            state = torch.load(ckpt, map_location="cpu", weights_only=True)
+            state = {k: (v.float() if v.is_floating_point() else v) for k, v in state.items()}
             model.load_state_dict(state, strict=False)
             model.eval()
             self._csi = (tok, model)
