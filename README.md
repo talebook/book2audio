@@ -17,14 +17,26 @@ uv run python -m book2audio -i book/xuanjian.txt -c 1-3 -o output/xuanjian_ch1-3
 
 依赖：`ffmpeg`（`brew install ffmpeg`）。
 
-## 当前流水线（v0.1，edge-tts 基线）
+## 当前流水线
 
 ```
-TXT → 章节分割（正则） → 对白/旁白切分（引号规则） → edge-tts 双音色合成 → ffmpeg 拼接 → MP4（带章节标记）
+TXT → 章节分割 → 说话人识别(L1规则+L2 CSI模型) → 角色画像(L3规则) → 音色分配 → TTS → MP4(带章节标记)
 ```
 
-- 旁白：`zh-CN-YunjianNeural`；对白：`zh-CN-YunxiNeural`
-- 说话人识别（按角色分配音色）和高真人感 TTS 后端见路线图
+常用命令：
+
+```bash
+# 多角色有声书（edge-tts，快）
+uv run python -m book2audio -i book/xuanjian.txt -c 1-3 -o out.mp4 --multi-voice
+# 识别报告（不做TTS，人工校对界面）
+uv run python -m book2audio -i book/xuanjian.txt -c 1-3 -o report.md
+# CosyVoice3 本地零样本克隆（真人感更强；Mac CPU RTF≈9.5 很慢，适合远程GPU）
+uv run python -m book2audio -i book.txt -c 1 -o out.mp4 --multi-voice --engine cosyvoice
+```
+
+- 说话人识别：规则层 R1-R8 + CSI RoBERTa（`models/csi-v1`，fp16 650MB），金标 93%
+- 角色画像：纯规则（性别/年龄/称呼语/辈分），(gender, age_stage) → 音色桶
+- CosyVoice 音色库：`voicebank/bank.json`（参考音频+转写；量产请换真人录音）
 
 ## 目录结构
 
@@ -38,8 +50,10 @@ tests/              评测记录
 
 ## 路线图（摘要）
 
-1. ✅ edge-tts 端到端基线（本版本）
-2. 程序化说话人识别库：规则层 + CSI 专用模型（见 `research/tech_reselect_20260610/`）
-3. 高真人感 TTS：CosyVoice3-0.5B 主线，IndexTTS-2 / 豆包 API 备选
-4. 角色画像 → 音色自动映射；年龄变化音色过渡
-5. 背景音/环境音（P2）
+1. ✅ edge-tts 端到端基线
+2. ✅ 程序化说话人识别库：规则 R1-R8 + CSI 模型融合（`research/attribution_proto_20260610/`）
+3. ✅ 角色画像 → 音色自动映射（L3 纯规则）
+4. ✅ CosyVoice3-0.5B 本地引擎（zero-shot 克隆；Mac CPU 慢，量产走远程 GPU）
+5. 真人参考音色库 + 远程 GPU 批量渲染；情绪→TTS 控制（CosyVoice instruct 已预留）
+6. 年龄变化音色过渡；指代消解/别名归一（识别的下一个台阶）
+7. 背景音/环境音（P2）
