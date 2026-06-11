@@ -30,13 +30,16 @@ NAME_STOPWORDS = {
     "厉声", "柔声", "朗声", "一声", "说完", "听完", "点头", "摇头", "笑着", "哭着", "似乎",
     "仿佛", "彷佛", "不禁", "不由", "暗暗", "暗自", "喃喃", "自己", "众人", "有人", "no",
     "不知", "谁知", "哪知", "岂知", "只见", "只听", "便是", "就是", "正是", "于此",
+    # 泛称（指人但非具体角色名，会造成幽灵角色/错配音色）
+    "老人", "老者", "老汉", "老妪", "老翁", "道童", "童子", "妇人", "汉子", "青年", "丫鬟",
 }
 
 
 def plausible_name(cand: str) -> bool:
     return (cand not in NAME_STOPWORDS
-            and not cand.endswith(("地", "得", "的", "着", "了"))
-            and not any(w in cand for w in "这那什怎他她它谁"))
+            and not cand.endswith(("地", "得", "的", "着", "了", "家"))   # "袁家"是家族非个人
+            and not cand.startswith(("不", "没", "无", "别", "莫"))       # "不曾/莫非"类
+            and not any(w in cand for w in "这那什怎他她它谁么"))
 
 
 # 常见姓氏：用于过滤 jieba-NER 通道的噪声（"小河/修仙"等误判）
@@ -102,9 +105,22 @@ class Attributor:
         # 必须至少出现一次"名字+说话动词"（仅段首高频不算，避免"剧烈的摇晃"这类误收）
         cand = {n for n, c in counts.items()
                 if c >= 2 and verb_counts.get(n, 0) >= 1 and plausible_name(n)}
-        # 去掉被更长名字包含的碎片（"长湖"⊂"李长湖"，前后缀都算）
-        self.names |= {n for n in cand
-                       if not any(o != n and n in o and counts[o] >= counts[n] for o in cand)}
+
+        # 去掉碎片候选："长湖"⊂"李长湖"；"李渊"⊂{李渊平,李渊蛟}（在原文中几乎不独立出现）
+        def fragment(n):
+            longers = [o for o in cand if o != n and n in o]
+            if longers and any(counts[o] >= counts[n] for o in longers):
+                return True
+            if longers:
+                total = len(re.findall(re.escape(n), text))
+                inside = sum(len(re.findall(re.escape(o), text)) for o in longers)
+                if total - inside <= 1:
+                    return True
+            # "李渊"⊂{李渊平,李渊蛟}：≥2个不同延伸字各出现≥2次 → 多名字公共前缀，丢弃
+            ext = re.findall(rf"{re.escape(n)}([一-龥])", text)
+            frequent_ext = {c for c in set(ext) if ext.count(c) >= 2}
+            return len(frequent_ext) >= 2 and len(ext) >= 0.9 * len(re.findall(re.escape(n), text))
+        self.names |= {n for n in cand if not fragment(n)}
 
     def to_name(self, cand: str) -> Optional[str]:
         """候选串映射到已知角色名（互为子串即认为同一角色，如"长湖"→"李长湖"）。"""
@@ -135,9 +151,13 @@ class Attributor:
 
     @staticmethod
     def is_addressee(name: str, quote_text: str) -> bool:
-        """引文中以称呼语出现的名字是受话人，不是说话人（如“项平哥”→李项平被排除）。"""
+        """引文中以称呼语出现的名字是受话人，不是说话人（如“项平哥”→李项平、“云儿”→孟灼云）。"""
         tail = name[-2:]
-        return bool(re.search(rf"{re.escape(tail)}[哥妹姐弟叔婶兄]", quote_text))
+        if re.search(rf"{re.escape(tail)}[哥妹姐弟叔婶兄]", quote_text):
+            return True
+        # 昵称式呼唤："云儿。" → 排除名字含"云"的角色
+        m = re.fullmatch(r"([一-龥]{1,2})儿[！？。，…—\s]*", quote_text.strip())
+        return bool(m and m.group(1) in name)
 
     # ---------- L1 规则 ----------
     def rule_attribute(self, paras: List[str], q: Quote):
@@ -151,14 +171,19 @@ class Attributor:
         m = R2_BEFORE.search(before)
         if m and self.to_name(m.group(1)):
             return self.to_name(m.group(1)), "R2"
-        # R5: 引文独立成段且上一段以冒号收尾（"X喊道："↵ 引文）→ 取上段主语
+        # R5: 引文独立成段且上一段以冒号收尾（"X喊道："↵ 引文）
+        # 取离冒号最近（最右）的角色名："李曦峸点头退下，李渊平仔细算了算：" → 李渊平
         if not before.strip() and not after.strip() and q.para_idx > 0:
             prev = paras[q.para_idx - 1]
             if prev.rstrip().endswith(("：", ":")):
-                m = SUBJ_LEAD.match(prev)
-                name = self.to_name(m.group(1)) if m else None
-                if name and not self.is_addressee(name, q.text):
-                    return name, "R5"
+                # 只在冒号所在的最后分句找名字，避免把前面分句的宾语当说话人
+                # （"…交到李曦峸手中，继续道："→ 最后分句"继续道"无名字，不触发）
+                last_clause = re.split(r"[，；]", prev.rstrip("：: "))[-1]
+                hits = [(last_clause.rfind(n), n) for n in self.names if n in last_clause]
+                if hits:
+                    name = max(hits)[1]
+                    if not self.is_addressee(name, q.text):
+                        return name, "R5"
         return None, ""
 
     def rule_fallback(self, paras: List[str], q: Quote, recent: List[str]):
@@ -267,6 +292,9 @@ class Attributor:
                 if s.strip():
                     units.append((s.strip(), False))
 
+        # R7: 连续说话——上一段是"（他）继续道：/复又道："且段内无角色名 → 延续上一条说话人
+        CONT_RE = re.compile(r"(?:继续|复又|接着|又|续)(?:说|道)[：:]\s*$")
+
         recent: List[str] = []
         for qi, q in enumerate(quotes):
             # 拟声词不是对白
@@ -275,6 +303,11 @@ class Attributor:
                 continue
             # L1 高置信
             speaker, method = self.rule_attribute(paras, q)
+            if not speaker and recent and q.para_idx > 0:
+                prev = paras[q.para_idx - 1]
+                last_clause = re.split(r"[，；]", prev.rstrip())[-1]
+                if CONT_RE.search(prev) and not any(n in last_clause for n in self.names):
+                    speaker, method = recent[-1], "R7"
             # L2 CSI
             if not speaker and self.csi_model_dir:
                 span, score = self.csi_attribute(units, unit_of_quote[qi])

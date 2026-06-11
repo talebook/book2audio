@@ -14,7 +14,7 @@ from book2audio.attribution import Attributor  # noqa: E402
 
 def main():
     use_csi = "--no-csi" not in sys.argv
-    text = (ROOT / "book/chat.txt").read_text(encoding="utf-8")
+    text = (Path(__file__).parent / "sample_gold.txt").read_text(encoding="utf-8")
     gold = [q["speaker"] for q in json.loads(
         (Path(__file__).parent / "gold_chat.json").read_text())["quotes"]]
 

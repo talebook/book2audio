@@ -40,7 +40,7 @@ def ask(model: str, prompt: str) -> tuple:
 
 def main():
     model = sys.argv[1] if len(sys.argv) > 1 else "qwen3:0.6b"
-    text = (ROOT / "book/chat.txt").read_text(encoding="utf-8")
+    text = (Path(__file__).parent / "sample_gold.txt").read_text(encoding="utf-8")
     gold = [q["speaker"] for q in json.loads(
         (Path(__file__).parent / "gold_chat.json").read_text())["quotes"]]
 
