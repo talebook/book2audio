@@ -28,8 +28,11 @@ TXT → 章节分割 → 说话人识别(L1规则+L2 CSI模型) → 角色画像
 ```bash
 # 多角色有声书（edge-tts，快）
 uv run python -m book2audio -i book/xuanjian.txt -c 1-3 -o out.mp4 --multi-voice
-# 识别报告（不做TTS，人工校对界面）
+# 识别报告（只读，人工查看）
 uv run python -m book2audio -i book/xuanjian.txt -c 1-3 -o report.md
+# 配音脚本（中间格式，可编辑后回灌）：先导出 → 人工改错行/角色表 → 再合成
+uv run python -m book2audio -i book/xuanjian.txt -c 1-3 -o draft.script
+uv run python -m book2audio --from-script draft.script -o out.mp4 --engine edge
 # CosyVoice3 本地零样本克隆（真人感更强；Mac CPU RTF≈9.5 很慢，适合远程GPU）
 uv run python -m book2audio -i book.txt -c 1 -o out.mp4 --multi-voice --engine cosyvoice
 ```

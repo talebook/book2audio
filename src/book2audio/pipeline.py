@@ -1,4 +1,11 @@
-"""端到端流水线：TXT -> 章节 -> 对白/旁白 -> edge-tts 合成 -> ffmpeg 拼接为 MP4 有声书"""
+"""端到端流水线：TXT -> 章节 -> 对白/旁白 -> TTS 合成 -> ffmpeg 拼接为 MP4 有声书
+
+输出模式按 -o 后缀/参数分流：
+  .mp4           合成有声书（--multi-voice 多角色，--engine edge|cosyvoice）
+  .md            只读识别报告（人工查看）
+  .script        可编辑配音脚本（中间格式，改完用 --from-script 回灌合成）
+  --from-script  从配音脚本直接合成，跳过识别（用人工校正后的归属）
+"""
 
 import asyncio
 import json
@@ -30,12 +37,23 @@ async def _synth_one(text: str, voice: str, out_path: Path, sem: asyncio.Semapho
                     return
             except Exception as e:
                 if attempt == MAX_RETRIES:
-                    raise RuntimeError(f"TTS failed after {MAX_RETRIES} tries: {text[:30]}...") from e
+                    raise RuntimeError(f"edge-tts failed: {text[:30]}...") from e
                 await asyncio.sleep(2 * attempt)
 
 
+def _merge_adjacent(parts):
+    """合并相邻同音色片段，减少请求数。"""
+    merged = []
+    for text, v in parts:
+        if merged and merged[-1][1] == v:
+            merged[-1] = (merged[-1][0] + "\n" + text, v)
+        else:
+            merged.append((text, v))
+    return merged
+
+
 def _multivoice_parts(chapter: Chapter, quotes, voices):
-    """按说话人归属结果构造 (text, (voice, rate, pitch)) 列表。"""
+    """识别结果 -> (text, voicespec) 段列表。旁白/拟声/未识别用旁白音，对白用角色音。"""
     from .casting import NARRATOR
 
     by_para = {}
@@ -50,120 +68,161 @@ def _multivoice_parts(chapter: Chapter, quotes, voices):
             if para[pos:q.span[0]].strip():
                 parts.append((para[pos:q.span[0]], NARRATOR))
             if q.kind == "sfx" or not q.speaker:
-                # 拟声词/未识别 → 旁白连引号一起读
                 parts.append((para[q.span[0]:q.span[1]], NARRATOR))
             else:
                 parts.append((q.text, voices.get(q.speaker, (DIALOGUE_VOICE, "+0%", "+0Hz"))))
             pos = q.span[1]
         if para[pos:].strip():
             parts.append((para[pos:], NARRATOR))
-    # 合并相邻同音色片段，减少请求数
-    merged = []
-    for text, v in parts:
-        if merged and merged[-1][1] == v:
-            merged[-1] = (merged[-1][0] + "\n" + text, v)
-        else:
-            merged.append((text, v))
-    return merged
+    return _merge_adjacent(parts)
 
 
-async def synth_chapter(chapter: Chapter, work_dir: Path, quotes=None, voices=None) -> Path:
-    """合成单章音频，返回章节 mp3 路径。quotes/voices 提供时启用多角色音色。"""
-    if quotes is not None:
-        parts = _multivoice_parts(chapter, quotes, voices)
-    else:
-        segments = split_segments(chapter.content)
-        parts = [(chapter.title, (NARRATOR_VOICE, "+0%", "+0Hz"))] + [
-            (s.text, ((NARRATOR_VOICE if s.kind == "narration" else DIALOGUE_VOICE), "+0%", "+0Hz"))
-            for s in segments]
+def _script_parts(title: str, segments, voices, narrator_spec):
+    """配音脚本段 -> (text, voicespec) 段列表（与 _multivoice_parts 输出同构）。"""
+    parts = [(title, narrator_spec)]
+    for tag, text in segments:
+        spec = narrator_spec if tag in ("旁白", "音", "?") else voices.get(tag, narrator_spec)
+        parts.append((text, spec))
+    return _merge_adjacent(parts)
 
+
+async def synth_chapter_edge(parts, work_dir: Path, ch_num: int) -> Path:
+    """edge-tts 合成一章（parts: [(text,(voice,rate,pitch)),...]），返回章节 mp3。"""
     sem = asyncio.Semaphore(CONCURRENCY)
-    seg_dir = work_dir / f"ch{chapter.num:04d}"
+    seg_dir = work_dir / f"ch{ch_num:04d}"
     seg_dir.mkdir(parents=True, exist_ok=True)
-    tasks = []
-    seg_files = []
+    seg_files, tasks = [], []
     for i, (text, (voice, rate, pitch)) in enumerate(parts):
         f = seg_dir / f"{i:05d}.mp3"
         seg_files.append(f)
         tasks.append(_synth_one(text, voice, f, sem, rate, pitch))
     await asyncio.gather(*tasks)
 
-    # ffmpeg concat 合并段落
     list_file = seg_dir / "list.txt"
     list_file.write_text("".join(f"file '{f.resolve()}'\n" for f in seg_files))
-    chapter_mp3 = work_dir / f"chapter_{chapter.num:04d}.mp3"
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-         "-i", str(list_file), "-c", "copy", str(chapter_mp3)],
-        check=True,
-    )
+    chapter_mp3 = work_dir / f"chapter_{ch_num:04d}.mp3"
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                    "-i", str(list_file), "-c", "copy", str(chapter_mp3)], check=True)
     return chapter_mp3
 
 
-def _duration_ms(path: Path) -> int:
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "json", str(path)],
-        check=True, capture_output=True, text=True,
-    )
-    return int(float(json.loads(out.stdout)["format"]["duration"]) * 1000)
-
-
-def assemble_mp4(chapters: List[Chapter], chapter_files: List[Path], output: Path, work_dir: Path):
-    """拼接所有章节并编码为带章节标记的 MP4（AAC）。"""
-    list_file = work_dir / "all_chapters.txt"
-    list_file.write_text("".join(f"file '{f.resolve()}'\n" for f in chapter_files))
-
-    # 生成 FFMETADATA 章节标记
-    meta_lines = [";FFMETADATA1", "title=玄鉴仙族", "artist=book2audio"]
-    start = 0
-    for ch, f in zip(chapters, chapter_files):
-        end = start + _duration_ms(f)
-        meta_lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={start}", f"END={end}", f"title={ch.title}"]
-        start = end
-    meta_file = work_dir / "metadata.txt"
-    meta_file.write_text("\n".join(meta_lines))
-
-    output.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
-         "-i", str(list_file), "-i", str(meta_file), "-map_metadata", "1",
-         "-c:a", "aac", "-b:a", "64k", str(output)],
-        check=True,
-    )
-
-
-def synth_all_cosyvoice(chapters, quotes_by_ch, cosy_voices, narrator, work_dir: Path):
+def synth_all_cosyvoice(parts_by_ch, narrator, work_dir: Path):
     """CosyVoice 路径：全书片段一次性批量合成（均摊模型加载），返回各章音频文件。"""
     from .tts import CosyVoiceEngine
 
     engine = CosyVoiceEngine()
     chapter_segs = {}
-    for ch in chapters:
-        parts = _multivoice_parts(ch, quotes_by_ch[ch.num], cosy_voices)
-        seg_dir = work_dir / f"ch{ch.num:04d}"
+    for ch_num, parts in parts_by_ch.items():
+        seg_dir = work_dir / f"ch{ch_num:04d}"
         seg_dir.mkdir(parents=True, exist_ok=True)
         segs = []
-        for i, (text, voice) in enumerate(parts):
+        for i, (text, spec) in enumerate(parts):
             # cosy 音色是 (wav, text) 二元组；旁白占位（edge 三元组）回退到旁白参考音
-            wav, prompt_text = voice if (isinstance(voice, tuple) and len(voice) == 2) else narrator
+            wav, prompt_text = spec if (isinstance(spec, tuple) and len(spec) == 2) else narrator
             out = seg_dir / f"{i:05d}.wav"
             engine._batch.append({"text": text, "prompt_wav": wav,
                                   "prompt_text": prompt_text, "out": str(out)})
             segs.append(out)
-        chapter_segs[ch.num] = segs
+        chapter_segs[ch_num] = segs
     print(f"CosyVoice 批量合成 {sum(len(s) for s in chapter_segs.values())} 个片段（CPU较慢，请耐心）...")
     engine.flush()
 
     chapter_files = []
-    for ch in chapters:
-        list_file = work_dir / f"ch{ch.num:04d}/list.txt"
-        list_file.write_text("".join(f"file '{f.resolve()}'\n" for f in chapter_segs[ch.num]))
-        out = work_dir / f"chapter_{ch.num:04d}.wav"
+    for ch_num, segs in chapter_segs.items():
+        list_file = work_dir / f"ch{ch_num:04d}/list.txt"
+        list_file.write_text("".join(f"file '{f.resolve()}'\n" for f in segs))
+        out = work_dir / f"chapter_{ch_num:04d}.wav"
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
                         "-i", str(list_file), "-c", "copy", str(out)], check=True)
         chapter_files.append(out)
     return chapter_files
+
+
+def _duration_ms(path: Path) -> int:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)],
+        check=True, capture_output=True, text=True)
+    return int(float(json.loads(out.stdout)["format"]["duration"]) * 1000)
+
+
+def assemble_mp4(titles: List[str], chapter_files: List[Path], output: Path, work_dir: Path,
+                 book_title: str = "book2audio"):
+    """拼接所有章节并编码为带章节标记的 MP4（AAC）。"""
+    list_file = work_dir / "all_chapters.txt"
+    list_file.write_text("".join(f"file '{f.resolve()}'\n" for f in chapter_files))
+
+    meta_lines = [";FFMETADATA1", f"title={book_title}", "artist=book2audio"]
+    start = 0
+    for title, f in zip(titles, chapter_files):
+        end = start + _duration_ms(f)
+        meta_lines += ["[CHAPTER]", "TIMEBASE=1/1000", f"START={start}", f"END={end}", f"title={title}"]
+        start = end
+    meta_file = work_dir / "metadata.txt"
+    meta_file.write_text("\n".join(meta_lines))
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                    "-i", str(list_file), "-i", str(meta_file), "-map_metadata", "1",
+                    "-c:a", "aac", "-b:a", "64k", str(output)], check=True)
+
+
+def _resolve_voices(profiles, engine):
+    """画像 -> 音色表 + 旁白音。返回 (voices, narrator_spec)。"""
+    if engine == "cosyvoice":
+        from .casting import assign_cosy_voices
+        bank = json.loads(Path("voicebank/bank.json").read_text())
+        voices = assign_cosy_voices(profiles, bank)
+        nar = next(e for e in bank["voices"] if e["id"] == bank["narrator"])
+        return voices, (nar["wav"], nar["text"])
+    from .casting import NARRATOR, assign_voices
+    return assign_voices(profiles), NARRATOR
+
+
+def _synthesize(parts_by_ch, titles, output, engine, book_title, keep_temp):
+    work_dir = Path(tempfile.mkdtemp(prefix="book2audio_"))
+    try:
+        if engine == "cosyvoice":
+            bank = json.loads(Path("voicebank/bank.json").read_text())
+            nar = next(e for e in bank["voices"] if e["id"] == bank["narrator"])
+            chapter_files = synth_all_cosyvoice(parts_by_ch, (nar["wav"], nar["text"]), work_dir)
+        else:
+            chapter_files = []
+            for ch_num, parts in parts_by_ch.items():
+                print(f"[ch{ch_num}] edge 合成 {len(parts)} 段...")
+                chapter_files.append(asyncio.run(synth_chapter_edge(parts, work_dir, ch_num)))
+        print("拼接并编码 MP4...")
+        assemble_mp4(titles, chapter_files, output, work_dir, book_title)
+        print(f"完成: {output}")
+    finally:
+        if not keep_temp:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def run_from_script(script_path: Path, output: Path, engine: str = "edge", keep_temp: bool = False):
+    """从人工校正后的配音脚本直接合成，跳过识别。"""
+    from .casting import CharacterProfile
+    from .script import parse_script
+
+    cast, chapters = parse_script(script_path)
+    profiles = {n: CharacterProfile(name=n, gender=g, age_stage=s) for n, (g, s, _) in cast.items()}
+    voices, narrator_spec = _resolve_voices(profiles, engine)
+    # 应用音色覆盖
+    for n, (_, _, override) in cast.items():
+        if override:
+            if engine == "cosyvoice":
+                bank = json.loads(Path("voicebank/bank.json").read_text())
+                e = next((e for e in bank["voices"] if e["id"] == override), None)
+                if e:
+                    voices[n] = (e["wav"], e["text"])
+            else:
+                voices[n] = (override, "+0%", "+0Hz")
+
+    parts_by_ch, titles = {}, []
+    for i, (title, segs) in enumerate(chapters, 1):
+        parts_by_ch[i] = _script_parts(title, segs, voices, narrator_spec)
+        titles.append(title)
+    print(f"从脚本合成 {len(chapters)} 章，{len(cast)} 个角色，引擎 {engine}")
+    _synthesize(parts_by_ch, titles, output, engine, script_path.stem, keep_temp)
 
 
 def run(input_txt: Path, output: Path, chapter_range: range, keep_temp: bool = False,
@@ -177,60 +236,50 @@ def run(input_txt: Path, output: Path, chapter_range: range, keep_temp: bool = F
     print(f"共 {len(all_chapters)} 章，本次合成 {len(chapters)} 章: {chapters[0].title} .. {chapters[-1].title}")
 
     report_mode = output.suffix == ".md"
-    if report_mode:
+    script_mode = output.suffix == ".script"
+    if report_mode or script_mode:
         multi_voice = True
-    quotes_by_ch, voices = {}, None
+
+    quotes_by_ch, voices, profiles = {}, None, {}
     if multi_voice:
         from .attribution import Attributor
-        from .casting import assign_voices, build_profiles
+        from .casting import build_profiles
         attributor = Attributor(csi_model_dir=csi_model_dir if csi_model_dir.exists() else None)
         selected = "\n".join(c.content for c in chapters)
         attributor.build_names(selected)
-        # 先完成全部归属（CSI 会动态发现新角色），再建画像和音色表
         for ch in chapters:
             print(f"识别 {ch.title} 说话人...")
             quotes_by_ch[ch.num] = attributor.attribute(ch.content)
-        # 只给实际开口的角色建画像/分音色（注册表保持宽松，仅用于归属映射）
         speakers = {q.speaker for qs in quotes_by_ch.values() for q in qs if q.speaker}
         profiles = build_profiles(selected, speakers)
-        if engine == "cosyvoice":
-            from .casting import assign_cosy_voices
-            bank = json.loads(Path("voicebank/bank.json").read_text())
-            voices = assign_cosy_voices(profiles, bank)
-            print("角色音色分配 (cosyvoice 参考音):")
-            for n, (wav, _) in sorted(voices.items()):
-                p = profiles[n]
-                print(f"  {n}: {p.gender}/{p.age_stage} → {Path(wav).stem}")
-        else:
-            voices = assign_voices(profiles)
-            print("角色音色分配:")
-            for n, (v, rate, pitch) in sorted(voices.items()):
-                p = profiles[n]
-                print(f"  {n}: {p.gender}/{p.age_stage}{f'/{p.age}岁' if p.age else ''} → {v.replace('zh-CN-', '')} {rate} {pitch}")
+        voices, _ = _resolve_voices(profiles, engine)
+        print("角色音色分配:")
+        for n in sorted(voices):
+            p = profiles[n]
+            tag = voices[n][0]
+            print(f"  {n}: {p.gender}/{p.age_stage} → {Path(tag).stem if '/' in str(tag) else tag.replace('zh-CN-', '')}")
 
     if report_mode:
         from .report import write_report
         write_report(input_txt.stem, chapters, quotes_by_ch, profiles, voices, output)
         print(f"完成: {output}")
         return
+    if script_mode:
+        from .script import write_script
+        write_script(input_txt.stem, chapters, quotes_by_ch, profiles, voices, output)
+        print(f"完成: {output}（编辑后用 --from-script 回灌合成）")
+        return
 
-    work_dir = Path(tempfile.mkdtemp(prefix="book2audio_"))
-    try:
+    if multi_voice:
+        parts_by_ch = {ch.num: _multivoice_parts(ch, quotes_by_ch[ch.num], voices) for ch in chapters}
+    else:
         if engine == "cosyvoice":
-            if not multi_voice:
-                raise SystemExit("cosyvoice 引擎当前仅支持 --multi-voice 模式")
-            bank = json.loads(Path("voicebank/bank.json").read_text())
-            nar = next(e for e in bank["voices"] if e["id"] == bank["narrator"])
-            chapter_files = synth_all_cosyvoice(chapters, quotes_by_ch, voices,
-                                                (nar["wav"], nar["text"]), work_dir)
-        else:
-            chapter_files = []
-            for ch in chapters:
-                print(f"[{ch.num}/{chapters[-1].num}] 合成 {ch.title} ({len(ch.content)} 字)...")
-                chapter_files.append(asyncio.run(synth_chapter(ch, work_dir, quotes_by_ch.get(ch.num), voices)))
-        print("拼接并编码 MP4...")
-        assemble_mp4(chapters, chapter_files, output, work_dir)
-        print(f"完成: {output}")
-    finally:
-        if not keep_temp:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            raise SystemExit("cosyvoice 引擎当前仅支持 --multi-voice 模式")
+        parts_by_ch = {}
+        for ch in chapters:
+            ss = split_segments(ch.content)
+            parts_by_ch[ch.num] = [(ch.title, (NARRATOR_VOICE, "+0%", "+0Hz"))] + [
+                (s.text, ((NARRATOR_VOICE if s.kind == "narration" else DIALOGUE_VOICE), "+0%", "+0Hz"))
+                for s in ss]
+    titles = [ch.title for ch in chapters]
+    _synthesize(parts_by_ch, titles, output, engine, input_txt.stem, keep_temp)
